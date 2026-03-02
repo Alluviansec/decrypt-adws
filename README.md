@@ -6,7 +6,7 @@ For the full technical writeup, see: **[Decrypting ADWS Traffic: Peeling Back th
 
 ## What it does
 
-ADWS traffic (port 9389) is wrapped in 7 layers of encoding and encryption. Even with a valid keytab, Wireshark's built-in dissectors won't decrypt it. This script peels back every layer:
+ADWS traffic (port 9389) when encrypted by Kerberos is wrapped in 7 layers of encoding and encryption. Even with a valid keytab, Wireshark's built-in dissectors won't decrypt it (It can handle NTLM easily but the output is fragmented, massive SOAP XML and not exactly user friendly. This script peels back every layer:
 
 ```
 TCP > .NET Message Framing > NegotiateStream (SPNEGO/Kerberos) > GSS-Wrap CFX
