@@ -1,0 +1,278 @@
+==============================================================================
+ADWS Decryption - Analyst Summary Report
+==============================================================================
+Pcap:      extrahop 2026-02-04 11.24.57 to 12.24.57 AEDT.pcapng
+Generated: 2026-02-27 16:27:58
+
+──────────────────────────────────────────────────────────────────────────────
+CONNECTION SUMMARY
+──────────────────────────────────────────────────────────────────────────────
+  Conn  Port    Auth      Principal                          Msgs  Actions
+  ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  1     31856   NTLM      LAB\fsmith                         2     Get, GetResponse
+  2     31857   NTLM      LAB\fsmith                         4     Enumerate, EnumerateResponse, Pull, PullResponse
+  3     31858   NTLM      LAB\fsmith                         2     Get, GetResponse
+  4     31859   NTLM      LAB\fsmith                         4     Enumerate, EnumerateResponse, Pull, PullResponse
+  5     52860   Kerberos  ldaptest@LAB.LOCAL                 2     Get, GetResponse
+  6     52862   Kerberos  ldaptest@LAB.LOCAL                 18    Get, GetResponse
+  7     52863   Kerberos  ldaptest@LAB.LOCAL                 12    Enumerate, EnumerateResponse, Pull, PullResponse
+  8     50440   NTLM      lab.local\fsmith                   2     Get, fault
+  9     50450   NTLM      lab.local\fsmith                   4     Enumerate, EnumerateResponse, Pull, PullResponse
+
+──────────────────────────────────────────────────────────────────────────────
+ATTACK PATTERN DETECTION
+──────────────────────────────────────────────────────────────────────────────
+  [!] HIGH: SOAPHound (Conn 2, LAB\fsmith)
+      Filter contains "soaphound" marker string
+  [!] HIGH: AS-REP Roasting (Conn 9, lab.local\fsmith)
+      LDAP filter targets DONT_REQ_PREAUTH accounts
+  [*] MEDIUM: Sensitive Attribute Harvesting (Conn 2, LAB\fsmith)
+      Requesting: msDS-AllowedToDelegateTo, unixUserPassword, userPassword
+  [i] INFO: Bulk AD Enumeration (Conn 2, LAB\fsmith)
+      521 objects returned in this connection
+  [i] INFO: Bulk AD Enumeration (Conn 7, ldaptest@LAB.LOCAL)
+      202 objects returned in this connection
+
+──────────────────────────────────────────────────────────────────────────────
+QUERY DETAILS
+──────────────────────────────────────────────────────────────────────────────
+  Conn 2 (Port 31857) - LAB\fsmith
+    Filter:     (!soaphound=*)
+    Base DN:    DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 31 requested
+                name, sAMAccountName, cn, dNSHostName, objectSid, objectGUID, primaryGroupID, distinguishedName
+                ... and 23 more
+    Response:   521 objects returned
+
+  Conn 4 (Port 31859) - LAB\fsmith
+    Filter:     (trustType=*)
+    Base DN:    DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 4 requested
+                trustAttributes, trustDirection, name, securityIdentifier
+
+  Conn 7 (Port 52863) - ldaptest@LAB.LOCAL
+    Filter:     (&(!(isDefunct=TRUE))(objectClass=attributeSchema)(|(attributeSyntax=2.5.5.17)(linkID=*)(systemFl...
+    Base DN:    CN=Schema,CN=Configuration,DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 5 requested
+                lDAPDisplayName, linkID, systemFlags, attributeSyntax, distinguishedName
+    Response:   202 objects returned
+
+  Conn 7 (Port 52863) - ldaptest@LAB.LOCAL
+    Filter:     (&(objectClass=classSchema)(subClassOf=user)(defaultObjectCategory=CN=Person,CN=Schema,CN=Configu...
+    Base DN:    CN=Schema,CN=Configuration,DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 5 requested
+                lDAPDisplayName, linkID, systemFlags, attributeSyntax, distinguishedName
+    Response:   202 objects returned
+
+  Conn 7 (Port 52863) - ldaptest@LAB.LOCAL
+    Filter:     (&(sAMAccountName=aragorn)(objectClass=user)(objectCategory=person))
+    Base DN:    DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 12 requested
+                distinguishedName, name, objectClass, objectGUID, givenName, sn, userPrincipalName, userAccountControl
+                ... and 4 more
+    Response:   202 objects returned
+
+  Conn 9 (Port 50450) - lab.local\fsmith
+    Filter:     (&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))
+    Base DN:    DC=lab,DC=local
+    Scope:      Subtree
+    Attributes: 11 requested
+                sAMAccountName, distinguishedName, userAccountControl, userPrincipalName, memberOf, description, pwdLastSet, lastLogon
+                ... and 3 more
+    Response:   10 objects returned
+
+
+──────────────────────────────────────────────────────────────────────────────
+EXTRACTED AD OBJECTS
+──────────────────────────────────────────────────────────────────────────────
+  Users (37 unique):
+    sAMAccountName        DN (CN)                     admin  UAC Flags                                                             SPNs  Groups
+    ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    Administrator         Administrator               1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    Guest                 Guest                              ACCOUNTDISABLE, PASSWD_NOTREQD, NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD  0     
+    krbtgt                krbtgt                      1      ACCOUNTDISABLE, NORMAL_ACCOUNT                                        1     
+    winrmtestuser         winrm test user             1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    kerbdemo              KerbDemo                           NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    ldaptest              LDAP Test User              1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    pgustavo              Pedro Gustavo               1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    lrodriguez            Lucho Rodriguez                    NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    wecserver             Wec Server                         NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    nmartha               Norah Martha                       NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    gandalf               Gandalf TheWhite            1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    bilbo                 Bilbo Baggins               1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    frodo                 Frodo Baggins               1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD, DONT_REQ_PREAUTH                0     Administrators
+    merry                 Merry Brandybuck                   NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    pippin                Pippin Took                        NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    samwise               Samwise Gamgee                     NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    saruman               Saruman\                           NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    smaug                 Smaug\                             NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    aragorn               Aragorn Arathorn            1      NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD, DONT_REQ_PREAUTH                0     
+    gimili                Gimili Gloin                       NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    legolas               Legolas Greenleaf                  NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD, DONT_REQ_PREAUTH                0     Users
+    boromir               Boromir\                           NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  0     
+    elrond                Elrond\                     1      NORMAL_ACCOUNT                                                        0     
+    SvcExtraHopDC         SvcExtraHopDC               1      NORMAL_ACCOUNT, NOT_DELEGATED                                         0     
+    dcdecrypt             dcdecrypt                   1      NORMAL_ACCOUNT                                                        0     
+    aa                    a a                         1      NORMAL_ACCOUNT                                                        0     
+    bb                    bb                          1      NORMAL_ACCOUNT                                                        0     
+    cc                    cc                          1      NORMAL_ACCOUNT                                                        0     
+    dd                    svctoomuchprivilege         1      NORMAL_ACCOUNT                                                        0     
+    ee                    ee                          1      NORMAL_ACCOUNT                                                        0     
+    ff                    fff                         1      NORMAL_ACCOUNT                                                        0     
+    gg                    gg                          1      NORMAL_ACCOUNT                                                        0     
+    hh                    hh                          1      NORMAL_ACCOUNT, DONT_REQ_PREAUTH                                      0     Account Operators, Administrators, Domain Admins
+    ii                    ii                          1      NORMAL_ACCOUNT                                                        0     
+    jj                    jj                          1      NORMAL_ACCOUNT                                                        0     
+    fsmith                FSmith                             NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD, DONT_REQ_PREAUTH                0     Remote Management Users
+    svc_loanmgr           svc_loanmgr                        NORMAL_ACCOUNT, DONT_EXPIRE_PASSWORD                                  1     
+
+  Computers (4 unique):
+    Name                  dNSHostName                             OS
+    ──────────────────────────────────────────────────────────────────────────────────────────────────────
+    DC01                  DC01.lab.local                          Windows Server 2025 Datacenter Evaluation
+    DESKTOP-OCQBS67       DESKTOP-OCQBS67.lab.local               Windows 11 Enterprise Evaluation
+    ADCS01                ADCS01.lab.local                        Windows Server 2022 Standard Evaluation
+    DC02                  DC02.lab.local                          Windows Server 2022 Standard Evaluation
+
+  Groups (51 unique):
+    Name                                         Members
+    ───────────────────────────────────────────────────────
+    Administrators                               17
+    Users                                        16
+    Guests                                       2
+    Print Operators                              0
+    Backup Operators                             0
+    Replicator                                   0
+    Remote Desktop Users                         0
+    Network Configuration Operators              0
+    Performance Monitor Users                    0
+    Performance Log Users                        0
+    Distributed COM Users                        0
+    IIS_IUSRS                                    1
+    Cryptographic Operators                      0
+    Event Log Readers                            0
+    Certificate Service DCOM Access              0
+    RDS Remote Access Servers                    0
+    RDS Endpoint Servers                         0
+    RDS Management Servers                       0
+    Hyper-V Administrators                       0
+    Access Control Assistance Operators          0
+    Remote Management Users                      2
+    Storage Replica Administrators               0
+    OpenSSH Users                                0
+    Domain Computers                             0
+    Domain Controllers                           0
+    Schema Admins                                1
+    Enterprise Admins                            1
+    Cert Publishers                              1
+    Domain Admins                                18
+    Domain Users                                 0
+    Domain Guests                                0
+    Group Policy Creator Owners                  1
+    RAS and IAS Servers                          0
+    Server Operators                             0
+    Account Operators                            12
+    Pre-Windows 2000 Compatible Access           3
+    Incoming Forest Trust Builders               0
+    Windows Authorization Access Group           1
+    Terminal Server License Servers              0
+    Allowed RODC Password Replication Group      0
+    Denied RODC Password Replication Group       8
+    Read-only Domain Controllers                 0
+    Enterprise Read-only Domain Controllers      0
+    Cloneable Domain Controllers                 0
+    Protected Users                              0
+    Key Admins                                   0
+    Enterprise Key Admins                        0
+    Forest Trust Accounts                        0
+    External Trust Accounts                      0
+    DnsAdmins                                    0
+    DnsUpdateProxy                               0
+
+  Other object types:
+    container: 240
+    attributeSchema: 199
+    dnsNode: 14
+    groupPolicyContainer: 10
+    foreignSecurityPrincipal: 5
+    organizationalUnit: 4
+    rIDSet: 2
+    msDFSR-Member: 2
+    msDFSR-LocalSettings: 2
+    msDFSR-Subscriber: 2
+    msDFSR-Subscription: 2
+    lostAndFound: 1
+    infrastructureUpdate: 1
+    rpcContainer: 1
+    fileLinkTracking: 1
+    linkTrackObjectMoveTable: 1
+    domainPolicy: 1
+    classStore: 1
+    nTFRSSettings: 1
+    dfsConfiguration: 1
+    msImaging-PSPs: 1
+    builtinDomain: 1
+    samServer: 1
+    rIDManager: 1
+    dnsZone: 1
+    msDFSR-GlobalSettings: 1
+    msDFSR-ReplicationGroup: 1
+    msDFSR-Content: 1
+    msDFSR-ContentSet: 1
+    msDFSR-Topology: 1
+    classSchema: 1
+
+──────────────────────────────────────────────────────────────────────────────
+STATISTICS
+──────────────────────────────────────────────────────────────────────────────
+  Total SOAP messages: 50
+  Connections:         9
+  Unique principals:   3
+    - LAB\fsmith
+    - lab.local\fsmith
+    - ldaptest@LAB.LOCAL
+  SOAP faults:         1
+  AD objects:          738
+    - container: 240
+    - attributeSchema: 199
+    - group: 102
+    - user: 86
+    - top: 38
+    - dnsNode: 14
+    - groupPolicyContainer: 10
+    - computer: 8
+    - foreignSecurityPrincipal: 5
+    - organizationalUnit: 4
+    - domainDNS: 2
+    - rIDSet: 2
+    - msDFSR-Member: 2
+    - msDFSR-LocalSettings: 2
+    - msDFSR-Subscriber: 2
+    - msDFSR-Subscription: 2
+    - lostAndFound: 1
+    - infrastructureUpdate: 1
+    - rpcContainer: 1
+    - fileLinkTracking: 1
+    - linkTrackObjectMoveTable: 1
+    - domainPolicy: 1
+    - classStore: 1
+    - nTFRSSettings: 1
+    - dfsConfiguration: 1
+    - msImaging-PSPs: 1
+    - builtinDomain: 1
+    - samServer: 1
+    - rIDManager: 1
+    - dnsZone: 1
+    - msDFSR-GlobalSettings: 1
+    - msDFSR-ReplicationGroup: 1
+    - msDFSR-Content: 1
+    - msDFSR-ContentSet: 1
+    - msDFSR-Topology: 1
+    - classSchema: 1
+
+==============================================================================

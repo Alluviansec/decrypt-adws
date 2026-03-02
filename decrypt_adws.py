@@ -4,14 +4,16 @@
 Decrypt ADWS (Active Directory Web Services) NMS traffic from a pcap.
 
 Parses IPv4/IPv6 TCP streams (default port 9389), extracts Kerberos
-AP-REQ/AP-REP to derive session keys, then decrypts GSS-Wrap CFX tokens
+AP-REQ/AP-REP or NTLM challenge/authenticate to derive session keys,
+then decrypts GSS-Wrap CFX tokens (Kerberos) or NTLM-sealed frames
 containing .NET Binary XML (MC-NBFX / MC-NBFS) SOAP messages.
 
-Supports pcap and pcapng formats, MIT keytab v2 files, and proper TCP
-reassembly with retransmission deduplication and gap detection.
+Supports pcap and pcapng formats, MIT keytab v2 files, NTLM authentication
+via NT hash or password, and proper TCP reassembly with retransmission
+deduplication and gap detection.
 
 Usage:
-    python decrypt_adws.py <pcap_file> <keytab_file> [--port PORT]
+    python decrypt_adws.py <pcap_file> [keytab_file] [--nthash HASH] [--password PW]
 
 Requires: dpkt, minikerberos, pycryptodome (Cryptodome)
 """
@@ -23,6 +25,8 @@ import uuid
 import base64
 import re
 import argparse
+import hashlib
+import hmac
 from collections import defaultdict, Counter
 
 import dpkt
@@ -30,6 +34,7 @@ from minikerberos.protocol.asn1_structs import (
     AP_REQ, AP_REP, EncTicketPart, EncAPRepPart, Authenticator,
 )
 from minikerberos.protocol.encryption import Key, _enctype_table
+from Cryptodome.Cipher import ARC4
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -1056,54 +1061,87 @@ def decrypt_gss_wrap_cfx(token_data, key, is_acceptor):
     return _enctype_table[key.enctype].decrypt(key, ku, ct)[:-16]
 
 
+def _find_all_positions(data, markers):
+    """Find all positions of any marker bytes in data, sorted by position."""
+    positions = []
+    for marker in markers:
+        start = 0
+        while True:
+            pos = data.find(marker, start)
+            if pos < 0:
+                break
+            positions.append(pos)
+            start = pos + 1
+    positions.sort()
+    return positions
+
+
 def extract_keys(c2s, s2c, keytab_entries):
     """Try each keytab entry to decrypt the Kerberos ticket.
     Returns (session_key, client_subkey, server_subkey, principal) or raises."""
-    pos = c2s.find(b'\x6e\x82')
-    if pos < 0: pos = c2s.find(b'\x6e\x81')
-    if pos < 0: pos = c2s.find(b'\x6e\x83')
-    if pos < 0: raise ValueError("AP-REQ not found")
 
-    apreq = AP_REQ.load(c2s[pos:])
-    ticket_cipher = bytes(apreq['ticket']['enc-part']['cipher'])
-    ticket_etype = int(apreq['ticket']['enc-part']['etype'])
+    # Find ALL candidate AP-REQ positions (tag 0x6e = APPLICATION 14 constructed)
+    # with various BER length encodings (0x81=1-byte, 0x82=2-byte, 0x83=3-byte)
+    apreq_markers = [b'\x6e\x82', b'\x6e\x81', b'\x6e\x83']
+    apreq_positions = _find_all_positions(c2s, apreq_markers)
+    if not apreq_positions:
+        raise ValueError("AP-REQ not found")
 
-    # Try each keytab entry that matches the enctype
+    # AP-REP markers (tag 0x6f = APPLICATION 15 constructed)
+    aprep_markers = [b'\x6f\x81', b'\x6f\x82', b'\x6f\x83']
+
+    # Try each candidate AP-REQ position
     last_error = None
-    for princ_name, realm, kvno, enctype, host_key in keytab_entries:
-        if enctype != ticket_etype:
-            continue
+    for pos in apreq_positions:
         try:
-            cs = _enctype_table[enctype]
-            ticket_pt = cs.decrypt(host_key, 2, ticket_cipher)
-            et = EncTicketPart.load(ticket_pt)
-            sk = Key(int(et['key']['keytype']), bytes(et['key']['keyvalue']))
+            apreq = AP_REQ.load(c2s[pos:])
+        except Exception:
+            continue  # False positive — not a valid AP-REQ at this offset
 
-            auth_pt = cs.decrypt(sk, 11, bytes(apreq['authenticator']['cipher']))
-            auth = Authenticator.load(auth_pt)
-            csk = None
-            if auth['subkey'] is not None and auth['subkey'].native is not None:
-                csk = Key(int(auth['subkey']['keytype']), bytes(auth['subkey']['keyvalue']))
-            principal = '/'.join(str(s) for s in auth['cname']['name-string']) + '@' + str(auth['crealm'])
+        ticket_cipher = bytes(apreq['ticket']['enc-part']['cipher'])
+        ticket_etype = int(apreq['ticket']['enc-part']['etype'])
 
-            pos2 = s2c.find(b'\x6f\x81')
-            if pos2 < 0: pos2 = s2c.find(b'\x6f\x82')
-            if pos2 < 0: pos2 = s2c.find(b'\x6f\x83')
-            if pos2 < 0: raise ValueError("AP-REP not found")
-            aprep = AP_REP.load(s2c[pos2:])
-            aprep_pt = cs.decrypt(sk, 12, bytes(aprep['enc-part']['cipher']))
-            ea = EncAPRepPart.load(aprep_pt)
-            ssk = sk
-            if ea['subkey'] is not None and ea['subkey'].native is not None:
-                ssk = Key(int(ea['subkey']['keytype']), bytes(ea['subkey']['keyvalue']))
-            return sk, csk, ssk, principal
-        except Exception as e:
-            last_error = e
-            continue
+        # Try each keytab entry that matches the enctype
+        for princ_name, realm, kvno, enctype, host_key in keytab_entries:
+            if enctype != ticket_etype:
+                continue
+            try:
+                cs = _enctype_table[enctype]
+                ticket_pt = cs.decrypt(host_key, 2, ticket_cipher)
+                et = EncTicketPart.load(ticket_pt)
+                sk = Key(int(et['key']['keytype']), bytes(et['key']['keyvalue']))
+
+                auth_pt = cs.decrypt(sk, 11, bytes(apreq['authenticator']['cipher']))
+                auth = Authenticator.load(auth_pt)
+                csk = None
+                if auth['subkey'] is not None and auth['subkey'].native is not None:
+                    csk = Key(int(auth['subkey']['keytype']), bytes(auth['subkey']['keyvalue']))
+                principal = '/'.join(str(s) for s in auth['cname']['name-string']) + '@' + str(auth['crealm'])
+
+                # Find AP-REP — try all candidate positions
+                aprep_positions = _find_all_positions(s2c, aprep_markers)
+                if not aprep_positions:
+                    raise ValueError("AP-REP not found")
+                aprep_ok = False
+                for pos2 in aprep_positions:
+                    try:
+                        aprep = AP_REP.load(s2c[pos2:])
+                        aprep_pt = cs.decrypt(sk, 12, bytes(aprep['enc-part']['cipher']))
+                        ea = EncAPRepPart.load(aprep_pt)
+                        ssk = sk
+                        if ea['subkey'] is not None and ea['subkey'].native is not None:
+                            ssk = Key(int(ea['subkey']['keytype']), bytes(ea['subkey']['keyvalue']))
+                        return sk, csk, ssk, principal
+                    except Exception:
+                        continue
+                raise ValueError("AP-REP found but could not be decrypted")
+            except Exception as e:
+                last_error = e
+                continue
 
     if last_error:
         raise ValueError(f"No keytab entry could decrypt the ticket (last error: {last_error})")
-    raise ValueError(f"No keytab entry matches ticket enctype {ticket_etype}")
+    raise ValueError("No keytab entry matches any ticket enctype found")
 
 
 def parse_ns_frames(data, is_c2s):
@@ -1711,6 +1749,758 @@ def _inject_sddl_comments(xml_text):
     return result
 
 
+# ─── NTLM Decryption Support ─────────────────────────────────────────────────
+
+def password_to_nthash(password):
+    """Derive NT hash from a plaintext password: MD4(UTF-16-LE(password))."""
+    from Cryptodome.Hash import MD4
+    return MD4.new(password.encode('utf-16-le')).digest()
+
+
+def extract_ntlm_from_sasl(data, is_c2s):
+    """Parse NMS preamble and SASL frames, extract NTLM Type 1/2/3 messages.
+
+    Works for both raw-NTLM and SPNEGO-wrapped NTLM since we search for
+    the NTLMSSP\\x00 signature regardless of wrapping.
+
+    Returns dict with keys 'type1', 'type2', 'type3' mapping to message bytes.
+    """
+    result = {}
+    marker = b'NTLMSSP\x00'
+    pos = 0
+    while True:
+        idx = data.find(marker, pos)
+        if idx < 0:
+            break
+        # Message type is a 4-byte LE uint32 right after the signature
+        if idx + 12 > len(data):
+            break
+        msg_type = struct.unpack_from('<I', data, idx + 8)[0]
+
+        # Determine message boundaries: scan for next NTLMSSP or use
+        # a reasonable heuristic. For SASL frames the NTLM message is
+        # embedded inside a framed structure, so we take until the next
+        # marker or end of data, but cap at a reasonable size.
+        next_idx = data.find(marker, idx + 12)
+        if next_idx < 0:
+            next_idx = len(data)
+        msg_data = data[idx:next_idx]
+
+        if msg_type == 1:
+            result['type1'] = msg_data
+        elif msg_type == 2:
+            result['type2'] = msg_data
+        elif msg_type == 3:
+            result['type3'] = msg_data
+
+        pos = idx + 12
+    return result
+
+
+def derive_ntlm_session_key(type2_msg, type3_msg, nt_hash):
+    """Derive NTLM session keys from Type 2 (challenge) and Type 3 (authenticate).
+
+    Returns (exported_session_key, client_sealing_key, server_sealing_key, principal).
+    Raises ValueError if the NT hash doesn't match.
+    """
+    # Parse ServerChallenge from Type 2 (offset 24, 8 bytes)
+    if len(type2_msg) < 32:
+        raise ValueError("Type 2 message too short")
+    server_challenge = type2_msg[24:32]
+
+    # Parse Type 3 message fields
+    if len(type3_msg) < 72:
+        raise ValueError("Type 3 message too short")
+
+    # NtChallengeResponse: security buffer at offset 20 (len:2, maxlen:2, offset:4)
+    nt_resp_len = struct.unpack_from('<H', type3_msg, 20)[0]
+    nt_resp_off = struct.unpack_from('<I', type3_msg, 24)[0]
+    nt_response = type3_msg[nt_resp_off:nt_resp_off + nt_resp_len]
+
+    # Domain: security buffer at offset 28
+    domain_len = struct.unpack_from('<H', type3_msg, 28)[0]
+    domain_off = struct.unpack_from('<I', type3_msg, 32)[0]
+    domain = type3_msg[domain_off:domain_off + domain_len].decode('utf-16-le', errors='replace')
+
+    # User: security buffer at offset 36
+    user_len = struct.unpack_from('<H', type3_msg, 36)[0]
+    user_off = struct.unpack_from('<I', type3_msg, 40)[0]
+    user = type3_msg[user_off:user_off + user_len].decode('utf-16-le', errors='replace')
+
+    # EncryptedRandomSessionKey: security buffer at offset 52
+    enc_sess_key_len = struct.unpack_from('<H', type3_msg, 52)[0]
+    enc_sess_key_off = struct.unpack_from('<I', type3_msg, 56)[0]
+    encrypted_random_session_key = type3_msg[enc_sess_key_off:enc_sess_key_off + enc_sess_key_len]
+
+    # NegotiateFlags at offset 60
+    negotiate_flags = struct.unpack_from('<I', type3_msg, 60)[0]
+
+    # NTProofStr is the first 16 bytes of NtChallengeResponse
+    if len(nt_response) < 16:
+        raise ValueError("NtChallengeResponse too short")
+    nt_proof_str = nt_response[:16]
+    # The rest is the NTv2 client blob
+    client_blob = nt_response[16:]
+
+    # ResponseKeyNT = HMAC_MD5(NT_Hash, UPPERCASE(User) + Domain) -- both UTF-16-LE
+    response_key_nt = hmac.new(
+        nt_hash,
+        user.upper().encode('utf-16-le') + domain.encode('utf-16-le'),
+        hashlib.md5
+    ).digest()
+
+    # Verify: NTProofStr should equal HMAC_MD5(ResponseKeyNT, ServerChallenge + ClientBlob)
+    expected_proof = hmac.new(
+        response_key_nt,
+        server_challenge + client_blob,
+        hashlib.md5
+    ).digest()
+
+    if nt_proof_str != expected_proof:
+        raise ValueError("NT hash does not match (NTProofStr verification failed)")
+
+    # SessionBaseKey = HMAC_MD5(ResponseKeyNT, NTProofStr)
+    session_base_key = hmac.new(response_key_nt, nt_proof_str, hashlib.md5).digest()
+
+    # ExportedSessionKey: if KEY_EXCH flag (0x40000000) is set, decrypt it
+    key_exch = negotiate_flags & 0x40000000
+    if key_exch and encrypted_random_session_key:
+        rc4 = ARC4.new(session_base_key)
+        exported_session_key = rc4.decrypt(encrypted_random_session_key)
+    else:
+        exported_session_key = session_base_key
+
+    # Derive sealing keys (MS-NLMP section 3.4.4)
+    # ClientSealingKey = MD5(ExportedSessionKey + "session key to client-to-server sealing key magic constant\x00")
+    client_sealing_key = hashlib.md5(
+        exported_session_key +
+        b'session key to client-to-server sealing key magic constant\x00'
+    ).digest()
+
+    server_sealing_key = hashlib.md5(
+        exported_session_key +
+        b'session key to server-to-client sealing key magic constant\x00'
+    ).digest()
+
+    principal = f'{domain}\\{user}'
+    return exported_session_key, client_sealing_key, server_sealing_key, principal
+
+
+def decrypt_ntlm_seal(frames, sealing_key):
+    """Decrypt NTLM-sealed frames using RC4.
+
+    Each frame has a 16-byte signature (Version:4 + Checksum:8 + SeqNum:4)
+    followed by the encrypted message body.
+
+    The RC4 cipher state persists across frames (streaming cipher).
+    After decrypting each message, we also advance the RC4 state by
+    decrypting the 8-byte checksum (for state synchronization).
+    """
+    rc4 = ARC4.new(sealing_key)
+    plaintext_parts = []
+
+    for frame in frames:
+        if len(frame) < 16:
+            continue
+        # Signature: Version(4) + Checksum(8) + SeqNum(4)
+        checksum = frame[4:12]
+        message_ciphertext = frame[16:]
+
+        if message_ciphertext:
+            plaintext = rc4.decrypt(message_ciphertext)
+            plaintext_parts.append(plaintext)
+
+        # Advance RC4 state for checksum (keeps cipher in sync)
+        rc4.decrypt(checksum)
+
+    return b''.join(plaintext_parts)
+
+
+def extract_ntlm_keys(c2s, s2c, nt_hashes):
+    """Extract NTLM session keys from the TCP stream data.
+
+    Parallel to extract_keys() for Kerberos.
+    Returns (client_sealing_key, server_sealing_key, principal).
+    """
+    # Extract NTLM messages from both directions
+    c2s_ntlm = extract_ntlm_from_sasl(c2s, True)
+    s2c_ntlm = extract_ntlm_from_sasl(s2c, False)
+
+    # Type 3 (Authenticate) comes from client, Type 2 (Challenge) from server
+    type3 = c2s_ntlm.get('type3')
+    type2 = s2c_ntlm.get('type2')
+
+    if not type2:
+        raise ValueError("NTLM Type 2 (Challenge) not found in server data")
+    if not type3:
+        raise ValueError("NTLM Type 3 (Authenticate) not found in client data")
+
+    # Try each NT hash
+    last_error = None
+    for nt_hash in nt_hashes:
+        try:
+            _, client_seal, server_seal, principal = derive_ntlm_session_key(
+                type2, type3, nt_hash)
+            return client_seal, server_seal, principal
+        except ValueError as e:
+            last_error = e
+            continue
+
+    raise ValueError(f"No NT hash matched the NTLM exchange (last error: {last_error})")
+
+
+# ─── Analyst Summary Report ──────────────────────────────────────────────────
+
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+NS = {
+    's': 'http://www.w3.org/2003/05/soap-envelope',
+    'a': 'http://www.w3.org/2005/08/addressing',
+    'wsen': 'http://schemas.xmlsoap.org/ws/2004/09/enumeration',
+    'ad': 'http://schemas.microsoft.com/2008/1/ActiveDirectory',
+    'addata': 'http://schemas.microsoft.com/2008/1/ActiveDirectory/Data',
+    'adlq': 'http://schemas.microsoft.com/2008/1/ActiveDirectory/Dialect/LdapQuery',
+}
+
+UAC_FLAGS = {
+    0x0001: 'SCRIPT',
+    0x0002: 'ACCOUNTDISABLE',
+    0x0008: 'HOMEDIR_REQUIRED',
+    0x0010: 'LOCKOUT',
+    0x0020: 'PASSWD_NOTREQD',
+    0x0040: 'PASSWD_CANT_CHANGE',
+    0x0080: 'ENCRYPTED_TEXT_PWD_ALLOWED',
+    0x0100: 'TEMP_DUPLICATE_ACCOUNT',
+    0x0200: 'NORMAL_ACCOUNT',
+    0x0800: 'INTERDOMAIN_TRUST_ACCOUNT',
+    0x1000: 'WORKSTATION_TRUST_ACCOUNT',
+    0x2000: 'SERVER_TRUST_ACCOUNT',
+    0x10000: 'DONT_EXPIRE_PASSWORD',
+    0x20000: 'MNS_LOGON_ACCOUNT',
+    0x40000: 'SMARTCARD_REQUIRED',
+    0x80000: 'TRUSTED_FOR_DELEGATION',
+    0x100000: 'NOT_DELEGATED',
+    0x200000: 'USE_DES_KEY_ONLY',
+    0x400000: 'DONT_REQ_PREAUTH',
+    0x800000: 'PASSWORD_EXPIRED',
+    0x1000000: 'TRUSTED_TO_AUTH_FOR_DELEGATION',
+    0x4000000: 'PARTIAL_SECRETS_ACCOUNT',
+}
+
+
+def _decode_uac_flags(uac_int):
+    """Decode userAccountControl integer to comma-separated flag names."""
+    flags = []
+    for bit, name in sorted(UAC_FLAGS.items()):
+        if uac_int & bit:
+            flags.append(name)
+    return ', '.join(flags) if flags else str(uac_int)
+
+
+_COMMENT_RE = re.compile(
+    r'<!--\s*Conn=(\d+)\s+Port=(\d+)\s+Dir=(\w+)\s+Msg=(\d+)\s+Principal=(.+?)\s*-->')
+
+
+def _parse_comment_header(line):
+    """Extract Conn, Port, Dir, Msg, Principal from comment header."""
+    m = _COMMENT_RE.search(line)
+    if not m:
+        return None
+    return {
+        'conn': int(m.group(1)),
+        'port': int(m.group(2)),
+        'dir': m.group(3),
+        'msg': int(m.group(4)),
+        'principal': m.group(5),
+    }
+
+
+def _local_name(tag):
+    """Strip namespace URI from an ElementTree tag."""
+    if '}' in tag:
+        return tag.split('}', 1)[1]
+    return tag
+
+
+def _extract_ad_object(elem):
+    """Extract AD attributes from an addata element, return {attr_name: [values]}."""
+    obj = {}
+    obj['_type'] = _local_name(elem.tag)
+    for child in elem:
+        attr_name = _local_name(child.tag)
+        if attr_name == 'objectReferenceProperty':
+            continue
+        values = []
+        for val_elem in child:
+            if _local_name(val_elem.tag) == 'value' and val_elem.text:
+                values.append(val_elem.text)
+        if not values and child.text:
+            values = [child.text]
+        if values:
+            obj[attr_name] = values
+    return obj
+
+
+def _parse_soap_messages(all_xml):
+    """Parse all XML entries into structured message dicts."""
+    parsed = []
+    for entry in all_xml:
+        lines = entry.split('\n', 1)
+        header = _parse_comment_header(lines[0])
+        if not header:
+            continue
+
+        xml_text = lines[1] if len(lines) > 1 else ''
+        msg = dict(header)
+        msg['action'] = ''
+        msg['filter'] = ''
+        msg['base_dn'] = ''
+        msg['scope'] = ''
+        msg['requested_attrs'] = []
+        msg['ad_objects'] = []
+        msg['fault_text'] = ''
+
+        # Fix unescaped ampersands from NBFX decoder (e.g. LDAP filters like (&(...)))
+        fixed_xml = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#)', '&amp;', xml_text)
+        try:
+            root = ET.fromstring(fixed_xml)
+        except ET.ParseError:
+            parsed.append(msg)
+            continue
+
+        # Extract SOAP Action
+        for elem in root.iter():
+            if _local_name(elem.tag) == 'Action' and elem.text:
+                # Get last path segment of the action URI
+                action = elem.text.rsplit('/', 1)[-1]
+                msg['action'] = action
+                break
+
+        # Extract LDAP query details (Enumerate requests)
+        for elem in root.iter():
+            ln = _local_name(elem.tag)
+            if ln == 'Filter' and elem.text and not elem.text.startswith('http'):
+                msg['filter'] = elem.text.strip()
+            elif ln == 'LdapQuery':
+                for child in elem:
+                    cln = _local_name(child.tag)
+                    if cln == 'Filter' and child.text:
+                        msg['filter'] = child.text.strip()
+                    elif cln == 'BaseObject' and child.text:
+                        msg['base_dn'] = child.text.strip()
+                    elif cln == 'Scope' and child.text:
+                        msg['scope'] = child.text.strip()
+
+        # Extract requested attributes (SelectionProperty)
+        for elem in root.iter():
+            if _local_name(elem.tag) == 'SelectionProperty' and elem.text:
+                attr = elem.text.strip()
+                # Strip namespace prefix (d: or addata:)
+                if ':' in attr:
+                    attr = attr.split(':', 1)[1]
+                msg['requested_attrs'].append(attr)
+
+        # Extract AD objects from PullResponse/GetResponse Items
+        for elem in root.iter():
+            ln = _local_name(elem.tag)
+            if ln == 'Items':
+                for child in elem:
+                    obj = _extract_ad_object(child)
+                    if obj:
+                        msg['ad_objects'].append(obj)
+            # Also handle GetResponse body (addata:top, addata:user, etc.)
+            elif ln in ('top', 'user', 'computer', 'group', 'organizationalUnit',
+                        'domainDNS', 'container', 'groupPolicyContainer'):
+                parent_ln = _local_name(elem.tag)
+                # Only if it's directly in the Body
+                obj = _extract_ad_object(elem)
+                if obj and len(obj) > 1:  # more than just _type
+                    msg['ad_objects'].append(obj)
+
+        # Extract fault text
+        for elem in root.iter():
+            if _local_name(elem.tag) == 'Text' and elem.text:
+                msg['fault_text'] = elem.text.strip()
+                break
+
+        parsed.append(msg)
+    return parsed
+
+
+def _detect_attack_patterns(parsed_messages):
+    """Detect known attack patterns. Returns list of (severity, name, description, conn, principal)."""
+    detections = []
+    seen = set()
+
+    for msg in parsed_messages:
+        conn = msg['conn']
+        principal = msg['principal']
+        filt = msg.get('filter', '')
+        attrs = msg.get('requested_attrs', [])
+        key_base = (conn, principal)
+
+        # AS-REP Roasting
+        if 'userAccountControl:1.2.840.113556.1.4.803:=4194304' in filt:
+            key = ('asrep', conn)
+            if key not in seen:
+                seen.add(key)
+                detections.append(('HIGH', 'AS-REP Roasting',
+                    f'LDAP filter targets DONT_REQ_PREAUTH accounts',
+                    conn, principal))
+
+        # SOAPHound
+        if filt and 'soaphound' in filt.lower():
+            key = ('soaphound_filter', conn)
+            if key not in seen:
+                seen.add(key)
+                detections.append(('HIGH', 'SOAPHound',
+                    f'Filter contains "soaphound" marker string',
+                    conn, principal))
+        elif attrs:
+            sensitive_bulk = {'nTSecurityDescriptor', 'member', 'servicePrincipalName'}
+            attr_set = set(attrs)
+            if sensitive_bulk.issubset(attr_set) and len(attrs) >= 15:
+                key = ('soaphound_bulk', conn)
+                if key not in seen:
+                    seen.add(key)
+                    detections.append(('HIGH', 'SOAPHound',
+                        f'Bulk enumeration with {len(attrs)} attrs including nTSecurityDescriptor + member + SPN',
+                        conn, principal))
+
+        # Kerberoasting Recon
+        if filt and 'servicePrincipalName' in filt.lower():
+            key = ('kerberoast', conn)
+            if key not in seen:
+                seen.add(key)
+                detections.append(('MEDIUM', 'Kerberoasting Recon',
+                    f'LDAP filter targets servicePrincipalName',
+                    conn, principal))
+
+        # Sensitive Attribute Harvesting
+        sensitive_attrs = {'msDS-AllowedToDelegateTo', 'userPassword', 'unixUserPassword'}
+        found_sensitive = sensitive_attrs.intersection(set(attrs))
+        if found_sensitive:
+            key = ('sensitive', conn)
+            if key not in seen:
+                seen.add(key)
+                detections.append(('MEDIUM', 'Sensitive Attribute Harvesting',
+                    f'Requesting: {", ".join(sorted(found_sensitive))}',
+                    conn, principal))
+
+    # Bulk AD Enumeration (check after all messages parsed)
+    conn_objects = defaultdict(int)
+    for msg in parsed_messages:
+        conn_objects[msg['conn']] += len(msg.get('ad_objects', []))
+    for msg in parsed_messages:
+        conn = msg['conn']
+        if conn_objects[conn] >= 20 and msg['action'] in ('Enumerate', 'Pull'):
+            key = ('bulk', conn)
+            if key not in seen:
+                seen.add(key)
+                detections.append(('INFO', 'Bulk AD Enumeration',
+                    f'{conn_objects[conn]} objects returned in this connection',
+                    conn, msg['principal']))
+
+    return sorted(detections, key=lambda x: {'HIGH': 0, 'MEDIUM': 1, 'INFO': 2}[x[0]])
+
+
+def _truncate(s, maxlen):
+    """Truncate string with ellipsis if needed."""
+    if len(s) <= maxlen:
+        return s
+    return s[:maxlen - 3] + '...'
+
+
+def _format_connection_table(parsed_messages):
+    """Format connection summary as fixed-width table."""
+    # Gather per-connection info
+    conns = {}
+    for msg in parsed_messages:
+        c = msg['conn']
+        if c not in conns:
+            conns[c] = {
+                'port': msg['port'],
+                'principal': msg['principal'],
+                'msgs': 0,
+                'actions': set(),
+            }
+        conns[c]['msgs'] += 1
+        if msg['action']:
+            conns[c]['actions'].add(msg['action'])
+
+    lines = []
+    lines.append(f"  {'Conn':<6}{'Port':<8}{'Auth':<10}{'Principal':<35}{'Msgs':<6}{'Actions'}")
+    lines.append(f"  {'─'*6}{'─'*8}{'─'*10}{'─'*35}{'─'*6}{'─'*50}")
+
+    for c in sorted(conns.keys()):
+        info = conns[c]
+        p = info['principal']
+        if '\\' in p:
+            auth = 'NTLM'
+        elif '@' in p:
+            auth = 'Kerberos'
+        else:
+            auth = 'Unknown'
+        actions = ', '.join(sorted(info['actions']))
+        lines.append(f"  {c:<6}{info['port']:<8}{auth:<10}{p:<35}{info['msgs']:<6}{actions}")
+
+    return '\n'.join(lines)
+
+
+def _format_query_details(parsed_messages):
+    """Format query details for Enumerate requests."""
+    lines = []
+    # Count response objects per connection
+    conn_objects = defaultdict(int)
+    for msg in parsed_messages:
+        conn_objects[msg['conn']] += len(msg.get('ad_objects', []))
+
+    for msg in parsed_messages:
+        if msg['action'] != 'Enumerate' or not msg['filter']:
+            continue
+        lines.append(f"  Conn {msg['conn']} (Port {msg['port']}) - {msg['principal']}")
+        lines.append(f"    Filter:     {_truncate(msg['filter'], 100)}")
+        if msg['base_dn']:
+            lines.append(f"    Base DN:    {msg['base_dn']}")
+        if msg['scope']:
+            lines.append(f"    Scope:      {msg['scope']}")
+        if msg['requested_attrs']:
+            lines.append(f"    Attributes: {len(msg['requested_attrs'])} requested")
+            # Show first few
+            shown = msg['requested_attrs'][:8]
+            rest = len(msg['requested_attrs']) - len(shown)
+            lines.append(f"                {', '.join(shown)}")
+            if rest > 0:
+                lines.append(f"                ... and {rest} more")
+        if conn_objects[msg['conn']] > 0:
+            lines.append(f"    Response:   {conn_objects[msg['conn']]} objects returned")
+        lines.append('')
+
+    return '\n'.join(lines)
+
+
+def _dedup_objects(objects, key_attr='sAMAccountName'):
+    """Deduplicate AD objects by key attribute, merging group memberships."""
+    seen = {}
+    for obj in objects:
+        key_vals = obj.get(key_attr, [])
+        key = key_vals[0] if key_vals else None
+        if not key:
+            # Fall back to distinguishedName
+            dn_vals = obj.get('distinguishedName', [])
+            key = dn_vals[0] if dn_vals else id(obj)
+        if key in seen:
+            # Merge: prefer non-empty values, union memberOf
+            existing = seen[key]
+            for attr, vals in obj.items():
+                if attr == '_type':
+                    continue
+                if attr == 'memberOf':
+                    existing_members = set(existing.get('memberOf', []))
+                    existing_members.update(vals)
+                    existing['memberOf'] = sorted(existing_members)
+                elif attr not in existing or not existing[attr]:
+                    existing[attr] = vals
+                elif attr == 'adminCount' and vals and vals[0] == '1':
+                    existing[attr] = vals
+        else:
+            seen[key] = dict(obj)
+    return list(seen.values())
+
+
+def _format_object_tables(parsed_messages):
+    """Format extracted AD objects grouped by type, deduplicated."""
+    users_raw = []
+    computers_raw = []
+    groups_raw = []
+    other_types = Counter()
+
+    for msg in parsed_messages:
+        for obj in msg.get('ad_objects', []):
+            otype = obj.get('_type', 'unknown')
+            if otype == 'user':
+                users_raw.append(obj)
+            elif otype == 'computer':
+                computers_raw.append(obj)
+            elif otype == 'group':
+                groups_raw.append(obj)
+            elif otype not in ('top', 'domainDNS'):
+                other_types[otype] += 1
+
+    # Deduplicate
+    users = _dedup_objects(users_raw, 'sAMAccountName')
+    computers = _dedup_objects(computers_raw, 'sAMAccountName')
+    groups = _dedup_objects(groups_raw, 'sAMAccountName')
+
+    lines = []
+
+    # Users table
+    if users:
+        lines.append(f"  Users ({len(users)} unique):")
+        lines.append(f"    {'sAMAccountName':<22}{'DN (CN)':<28}{'admin':<7}{'UAC Flags':<70}{'SPNs':<6}{'Groups'}")
+        lines.append(f"    {'─'*22}{'─'*28}{'─'*7}{'─'*70}{'─'*6}{'─'*30}")
+        for u in users:
+            sam = (u.get('sAMAccountName', [''])[0])
+            dn = u.get('distinguishedName', [''])[0]
+            cn = ''
+            if dn.startswith('CN='):
+                cn = dn.split(',', 1)[0][3:]
+            admin = u.get('adminCount', [''])[0]
+            uac_str = ''
+            if 'userAccountControl' in u:
+                try:
+                    uac_int = int(u['userAccountControl'][0])
+                    uac_str = _decode_uac_flags(uac_int)
+                except ValueError:
+                    uac_str = u['userAccountControl'][0]
+            spns = len(u.get('servicePrincipalName', []))
+            groups_list = u.get('memberOf', [])
+            group_names = []
+            for g in groups_list:
+                if g.startswith('CN='):
+                    group_names.append(g.split(',', 1)[0][3:])
+            group_str = ', '.join(group_names)
+
+            lines.append(f"    {sam:<22}{_truncate(cn, 26):<28}{admin:<7}{uac_str:<70}{spns:<6}{group_str}")
+        lines.append('')
+
+    # Computers table
+    if computers:
+        lines.append(f"  Computers ({len(computers)} unique):")
+        lines.append(f"    {'Name':<22}{'dNSHostName':<40}{'OS'}")
+        lines.append(f"    {'─'*22}{'─'*40}{'─'*40}")
+        for c in computers:
+            name = c.get('name', c.get('sAMAccountName', ['']))[0] if c.get('name', c.get('sAMAccountName')) else ''
+            dns = c.get('dNSHostName', [''])[0]
+            os_val = c.get('operatingSystem', [''])[0]
+            lines.append(f"    {name:<22}{dns:<40}{os_val}")
+        lines.append('')
+
+    # Groups table
+    if groups:
+        lines.append(f"  Groups ({len(groups)} unique):")
+        lines.append(f"    {'Name':<45}{'Members'}")
+        lines.append(f"    {'─'*45}{'─'*10}")
+        for g in groups:
+            name = g.get('name', g.get('sAMAccountName', ['']))[0] if g.get('name', g.get('sAMAccountName')) else ''
+            members = len(g.get('member', []))
+            lines.append(f"    {name:<45}{members}")
+        lines.append('')
+
+    # Other types
+    if other_types:
+        lines.append(f"  Other object types:")
+        for otype, count in other_types.most_common():
+            lines.append(f"    {otype}: {count}")
+        lines.append('')
+
+    if not lines:
+        lines.append('  No AD objects extracted.')
+
+    return '\n'.join(lines)
+
+
+def _format_statistics(parsed_messages):
+    """Format summary statistics."""
+    conns = set()
+    principals = set()
+    obj_types = Counter()
+    faults = 0
+
+    for msg in parsed_messages:
+        conns.add(msg['conn'])
+        principals.add(msg['principal'])
+        if msg['fault_text']:
+            faults += 1
+        for obj in msg.get('ad_objects', []):
+            obj_types[obj.get('_type', 'unknown')] += 1
+
+    lines = []
+    lines.append(f"  Total SOAP messages: {len(parsed_messages)}")
+    lines.append(f"  Connections:         {len(conns)}")
+    lines.append(f"  Unique principals:   {len(principals)}")
+    if principals:
+        for p in sorted(principals):
+            lines.append(f"    - {p}")
+    lines.append(f"  SOAP faults:         {faults}")
+    total_obj = sum(obj_types.values())
+    lines.append(f"  AD objects:          {total_obj}")
+    for otype, count in obj_types.most_common():
+        lines.append(f"    - {otype}: {count}")
+    return '\n'.join(lines)
+
+
+def generate_summary_report(all_xml, pcap_path):
+    """Generate analyst summary report from parsed SOAP messages."""
+    parsed = _parse_soap_messages(all_xml)
+    detections = _detect_attack_patterns(parsed)
+    pcap_name = os.path.basename(pcap_path)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    sections = []
+
+    # Header
+    sections.append('=' * 78)
+    sections.append('ADWS Decryption - Analyst Summary Report')
+    sections.append('=' * 78)
+    sections.append(f'Pcap:      {pcap_name}')
+    sections.append(f'Generated: {timestamp}')
+    sections.append('')
+
+    # Connection Summary
+    sections.append('─' * 78)
+    sections.append('CONNECTION SUMMARY')
+    sections.append('─' * 78)
+    sections.append(_format_connection_table(parsed))
+    sections.append('')
+
+    # Attack Pattern Detection
+    sections.append('─' * 78)
+    sections.append('ATTACK PATTERN DETECTION')
+    sections.append('─' * 78)
+    if detections:
+        for severity, name, desc, conn, principal in detections:
+            if severity == 'HIGH':
+                marker = '[!]'
+            elif severity == 'MEDIUM':
+                marker = '[*]'
+            else:
+                marker = '[i]'
+            sections.append(f'  {marker} {severity}: {name} (Conn {conn}, {principal})')
+            sections.append(f'      {desc}')
+    else:
+        sections.append('  No known attack patterns detected.')
+    sections.append('')
+
+    # Query Details
+    sections.append('─' * 78)
+    sections.append('QUERY DETAILS')
+    sections.append('─' * 78)
+    qd = _format_query_details(parsed)
+    if qd.strip():
+        sections.append(qd)
+    else:
+        sections.append('  No enumeration queries found.')
+    sections.append('')
+
+    # Extracted Objects
+    sections.append('─' * 78)
+    sections.append('EXTRACTED AD OBJECTS')
+    sections.append('─' * 78)
+    sections.append(_format_object_tables(parsed))
+
+    # Statistics
+    sections.append('─' * 78)
+    sections.append('STATISTICS')
+    sections.append('─' * 78)
+    sections.append(_format_statistics(parsed))
+    sections.append('')
+    sections.append('=' * 78)
+
+    return '\n'.join(sections)
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1718,22 +2508,41 @@ def main():
         description='Decrypt ADWS NMS (.NET Message Security) traffic from pcap/pcapng')
     parser.add_argument('pcap',
         help='Path to pcap or pcapng file')
-    parser.add_argument('keytab',
-        help='Path to MIT keytab v2 file')
+    parser.add_argument('keytab', nargs='?', default=None,
+        help='Path to MIT keytab v2 file (required for Kerberos decryption)')
     parser.add_argument('--port', type=int, default=0,
         help='ADWS port (default: auto-detect, or 9389)')
+    parser.add_argument('--nthash', action='append', default=[],
+        help='NT hash as hex string (can be specified multiple times)')
+    parser.add_argument('--password', action='append', default=[],
+        help='Password to derive NT hash from (can be specified multiple times)')
     args = parser.parse_args()
 
     pcap_path = args.pcap
     keytab_path = args.keytab
     target_port = args.port
 
+    # Build list of NT hashes
+    nt_hashes = []
+    for h in args.nthash:
+        nt_hashes.append(bytes.fromhex(h))
+    for pw in args.password:
+        nt_hashes.append(password_to_nthash(pw))
+
+    if not keytab_path and not nt_hashes:
+        parser.error('At least one of keytab or --nthash/--password is required')
+
     print(f"Pcap: {pcap_path}")
-    print(f"Keytab: {keytab_path}")
+    if keytab_path:
+        print(f"Keytab: {keytab_path}")
+    if nt_hashes:
+        print(f"NT hashes: {len(nt_hashes)} provided")
 
     # Parse keytab
-    print(f"\nParsing keytab...")
-    keytab_entries = parse_keytab(keytab_path)
+    keytab_entries = []
+    if keytab_path:
+        print(f"\nParsing keytab...")
+        keytab_entries = parse_keytab(keytab_path)
 
     # Open pcap
     print(f"\nOpening capture file...")
@@ -1812,24 +2621,61 @@ def main():
         if c2s_gaps or s2c_gaps:
             print(f"  WARNING: TCP gaps detected — decryption may fail")
 
-        try:
-            sk, csk, ssk, principal = extract_keys(c2s, s2c, keytab_entries)
-            print(f"  Principal: {principal}")
+        auth_method = None
+        principal = None
+        client_seal_key = None
+        server_seal_key = None
+        ssk = None
 
+        # Try Kerberos first
+        if keytab_entries:
+            try:
+                sk, csk, ssk, principal = extract_keys(c2s, s2c, keytab_entries)
+                auth_method = 'kerberos'
+                print(f"  Auth: Kerberos | Principal: {principal}")
+            except Exception as e:
+                kerb_err = str(e)
+                if 'AP-REQ not found' not in kerb_err and 'AP-REP not found' not in kerb_err:
+                    print(f"  Kerberos failed: {kerb_err}")
+
+        # Try NTLM if Kerberos didn't work
+        if auth_method is None and nt_hashes:
+            try:
+                client_seal_key, server_seal_key, principal = extract_ntlm_keys(
+                    c2s, s2c, nt_hashes)
+                auth_method = 'ntlm'
+                print(f"  Auth: NTLM | Principal: {principal}")
+            except Exception as e:
+                ntlm_err = str(e)
+                if 'not found' not in ntlm_err:
+                    print(f"  NTLM failed: {ntlm_err}")
+
+        if auth_method is None:
+            print(f"  Skipping (no supported auth found)")
+            continue
+
+        try:
             for direction, data, is_c2s, is_acc in [
                 ('C2S', c2s, True, False), ('S2C', s2c, False, True)
             ]:
                 frames = parse_ns_frames(data, is_c2s)
                 dec_stream = b''
-                for f in frames:
-                    try:
-                        pt = decrypt_gss_wrap_cfx(f, ssk, is_acc)
-                        if pt: dec_stream += pt
-                    except: pass
+
+                if auth_method == 'kerberos':
+                    for f in frames:
+                        try:
+                            pt = decrypt_gss_wrap_cfx(f, ssk, is_acc)
+                            if pt: dec_stream += pt
+                        except: pass
+                elif auth_method == 'ntlm':
+                    seal_key = client_seal_key if is_c2s else server_seal_key
+                    dec_stream = decrypt_ntlm_seal(frames, seal_key)
+
                 if not dec_stream: continue
 
+                safe_principal = principal.replace('\\', '_').replace('/', '_')
                 all_raw.append((
-                    f'conn{ci+1}_port{src_port}_{direction}_{principal}',
+                    f'conn{ci+1}_port{src_port}_{direction}_{safe_principal}',
                     dec_stream))
 
                 session_dict = {}
@@ -1878,10 +2724,17 @@ def main():
         with open(stream_path, 'wb') as f:
             f.write(raw_bytes)
 
+    # Generate analyst summary report
+    out_summary = os.path.join(base_dir, 'decrypted_adws_summary.txt')
+    summary = generate_summary_report(all_xml, pcap_path)
+    with open(out_summary, 'w', encoding='utf-8') as f:
+        f.write(summary)
+
     print(f"\n{'='*70}")
     print(f"Wrote {len(all_xml)} decoded SOAP messages to {out_xml}")
     print(f"Wrote {len(all_raw)} raw decrypted streams to {out_bin}")
     print(f"Wrote {len(all_raw)} individual stream files to {raw_dir}/")
+    print(f"Wrote analyst summary report to {out_summary}")
 
 
 if __name__ == '__main__':
