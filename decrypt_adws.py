@@ -41,7 +41,7 @@ if sys.platform == 'win32':
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 
-# ─── Keytab Parser ───────────────────────────────────────────────────────────
+# --- Keytab Parser ----------------------
 
 def parse_keytab(path):
     """Parse MIT keytab v2 file. Returns list of (principal, realm, kvno, enctype, Key)."""
@@ -109,7 +109,7 @@ def parse_keytab(path):
     return entries
 
 
-# ─── TCP Reassembler ─────────────────────────────────────────────────────────
+# --- TCP Reassembler ---------------------------------------------------------
 
 class TCPReassembler:
     """Track TCP segments per direction, deduplicate retransmissions, detect gaps."""
@@ -162,7 +162,7 @@ class TCPReassembler:
                 # Fill gap with zeros (mark it)
                 result.extend(b'\x00' * gap_size)
             elif rstart < expected_seq:
-                # Overlapping retransmission — take only the new bytes
+                # Overlapping retransmission - take only the new bytes
                 overlap = expected_seq - rstart
                 if overlap < len(data):
                     data = data[overlap:]
@@ -174,7 +174,7 @@ class TCPReassembler:
         return bytes(result), gaps
 
 
-# ─── Pcap/Pcapng Auto-detection ─────────────────────────────────────────────
+# --- Pcap/Pcapng Auto-detection ---------------------------------------------
 
 def open_pcap(path):
     """Auto-detect pcap vs pcapng and return appropriate dpkt reader."""
@@ -207,7 +207,7 @@ def open_pcap(path):
             return dpkt.pcap.Reader(fh)
 
 
-# ─── Packet Extraction ──────────────────────────────────────────────────────
+# --- Packet Extraction ------------------------------------------------------
 
 def extract_tcp_from_ipv4(raw):
     """Extract TCP fields from an IPv4 packet. Returns (src_ip, dst_ip, src_port, dst_port, seq, payload) or None."""
@@ -263,7 +263,7 @@ def extract_tcp_from_ipv6(raw):
         return None
 
 
-# ─── Static Dictionary (MC-NBFS / WCF built-in) ─────────────────────────────
+# --- Static Dictionary (MC-NBFS / WCF built-in) -----------------------------
 # Complete WCF ServiceModel static dictionary from ServiceModelStringsVersion1.cs
 # (.NET Framework reference source). Keys are WIRE VALUES (even integers) as
 # transmitted in MC-NBFX DictionaryString records. The wire value for logical
@@ -768,7 +768,7 @@ STATIC_DICT = {
 }
 
 
-# ─── MC-NBFX Binary XML Decoder ─────────────────────────────────────────────
+# --- MC-NBFX Binary XML Decoder ---------------------------------------------
 
 class NBFXDecoder:
     def __init__(self, data, session_dict=None):
@@ -1035,7 +1035,7 @@ class NBFXDecoder:
         return f'[text:{base:#04x}]'
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------------
 
 def read_mb32(data, offset):
     result = 0; shift = 0
@@ -1096,7 +1096,7 @@ def extract_keys(c2s, s2c, keytab_entries):
         try:
             apreq = AP_REQ.load(c2s[pos:])
         except Exception:
-            continue  # False positive — not a valid AP-REQ at this offset
+            continue  # False positive - not a valid AP-REQ at this offset
 
         ticket_cipher = bytes(apreq['ticket']['enc-part']['cipher'])
         ticket_etype = int(apreq['ticket']['enc-part']['etype'])
@@ -1118,7 +1118,7 @@ def extract_keys(c2s, s2c, keytab_entries):
                     csk = Key(int(auth['subkey']['keytype']), bytes(auth['subkey']['keyvalue']))
                 principal = '/'.join(str(s) for s in auth['cname']['name-string']) + '@' + str(auth['crealm'])
 
-                # Find AP-REP — try all candidate positions
+                # Find AP-REP - try all candidate positions
                 aprep_positions = _find_all_positions(s2c, aprep_markers)
                 if not aprep_positions:
                     raise ValueError("AP-REP not found")
@@ -1229,7 +1229,7 @@ def parse_nmf_records(stream, session_dict):
     return messages
 
 
-# ─── ADWS Port Detection ────────────────────────────────────────────────────
+# --- ADWS Port Detection ----------------------------------------------------
 
 def is_nmf_preamble(data):
     """Check if data starts with .NET Message Framing version record."""
@@ -1248,16 +1248,16 @@ def detect_adws_ports(packets):
     return ports
 
 
-# ─── Security Descriptor → SDDL Converter ────────────────────────────────────
+# --- Security Descriptor -> SDDL Converter ------------------------------------
 
-# Well-known SID → SDDL abbreviation mapping
+# Well-known SID -> SDDL abbreviation mapping
 # See: https://learn.microsoft.com/en-us/windows/win32/secauthz/sid-strings
 _WELLKNOWN_SIDS = {
     'S-1-0-0':   'WD',  # used sometimes, but WD is really S-1-1-0
     'S-1-1-0':   'WD',  # World / Everyone
     'S-1-3-0':   'CO',  # Creator Owner
     'S-1-3-1':   'CG',  # Creator Group
-    'S-1-5-1':   'DU',  # Dialup — reuse note: DU also used for Domain Users (RID-relative)
+    'S-1-5-1':   'DU',  # Dialup - reuse note: DU also used for Domain Users (RID-relative)
     'S-1-5-2':   'NU',  # Network
     'S-1-5-4':   'IU',  # Interactive
     'S-1-5-6':   'SU',  # Service
@@ -1296,7 +1296,7 @@ _WELLKNOWN_SIDS = {
     'S-1-15-2-1': 'AC',  # All App Packages
 }
 
-# Domain-relative RID → SDDL abbreviation
+# Domain-relative RID -> SDDL abbreviation
 _DOMAIN_RID_SDDL = {
     500: 'LA',  # Administrator
     501: 'LG',  # Guest
@@ -1514,9 +1514,9 @@ _ACE_TYPE_SDDL = {
     0x07: 'OU',  # SYSTEM_AUDIT_OBJECT
     0x09: 'A',   # ACCESS_ALLOWED_CALLBACK (treat as A)
     0x0A: 'D',   # ACCESS_DENIED_CALLBACK
-    0x0B: 'XA',  # ACCESS_ALLOWED_CALLBACK_OBJECT → XA
-    0x0C: 'XD',  # ACCESS_DENIED_CALLBACK_OBJECT → XD
-    0x11: 'XA',  # SYSTEM_MANDATORY_LABEL → treat as XA
+    0x0B: 'XA',  # ACCESS_ALLOWED_CALLBACK_OBJECT -> XA
+    0x0C: 'XD',  # ACCESS_DENIED_CALLBACK_OBJECT -> XD
+    0x11: 'XA',  # SYSTEM_MANDATORY_LABEL -> treat as XA
 }
 
 
@@ -1749,7 +1749,7 @@ def _inject_sddl_comments(xml_text):
     return result
 
 
-# ─── NTLM Decryption Support ─────────────────────────────────────────────────
+# --- NTLM Decryption Support -------------------------------------------------
 
 def password_to_nthash(password):
     """Derive NT hash from a plaintext password: MD4(UTF-16-LE(password))."""
@@ -1949,7 +1949,7 @@ def extract_ntlm_keys(c2s, s2c, nt_hashes):
     raise ValueError(f"No NT hash matched the NTLM exchange (last error: {last_error})")
 
 
-# ─── Analyst Summary Report ──────────────────────────────────────────────────
+# --- Analyst Summary Report --------------------------------------------------
 
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -2231,7 +2231,7 @@ def _format_connection_table(parsed_messages):
 
     lines = []
     lines.append(f"  {'Conn':<6}{'Port':<8}{'Auth':<10}{'Principal':<35}{'Msgs':<6}{'Actions'}")
-    lines.append(f"  {'─'*6}{'─'*8}{'─'*10}{'─'*35}{'─'*6}{'─'*50}")
+    lines.append(f"  {'-'*6}{'-'*8}{'-'*10}{'-'*35}{'-'*6}{'-'*50}")
 
     for c in sorted(conns.keys()):
         info = conns[c]
@@ -2339,7 +2339,7 @@ def _format_object_tables(parsed_messages):
     if users:
         lines.append(f"  Users ({len(users)} unique):")
         lines.append(f"    {'sAMAccountName':<22}{'DN (CN)':<28}{'admin':<7}{'UAC Flags':<70}{'SPNs':<6}{'Groups'}")
-        lines.append(f"    {'─'*22}{'─'*28}{'─'*7}{'─'*70}{'─'*6}{'─'*30}")
+        lines.append(f"    {'-'*22}{'-'*28}{'-'*7}{'-'*70}{'-'*6}{'-'*30}")
         for u in users:
             sam = (u.get('sAMAccountName', [''])[0])
             dn = u.get('distinguishedName', [''])[0]
@@ -2369,7 +2369,7 @@ def _format_object_tables(parsed_messages):
     if computers:
         lines.append(f"  Computers ({len(computers)} unique):")
         lines.append(f"    {'Name':<22}{'dNSHostName':<40}{'OS'}")
-        lines.append(f"    {'─'*22}{'─'*40}{'─'*40}")
+        lines.append(f"    {'-'*22}{'-'*40}{'-'*40}")
         for c in computers:
             name = c.get('name', c.get('sAMAccountName', ['']))[0] if c.get('name', c.get('sAMAccountName')) else ''
             dns = c.get('dNSHostName', [''])[0]
@@ -2381,7 +2381,7 @@ def _format_object_tables(parsed_messages):
     if groups:
         lines.append(f"  Groups ({len(groups)} unique):")
         lines.append(f"    {'Name':<45}{'Members'}")
-        lines.append(f"    {'─'*45}{'─'*10}")
+        lines.append(f"    {'-'*45}{'-'*10}")
         for g in groups:
             name = g.get('name', g.get('sAMAccountName', ['']))[0] if g.get('name', g.get('sAMAccountName')) else ''
             members = len(g.get('member', []))
@@ -2449,16 +2449,16 @@ def generate_summary_report(all_xml, pcap_path):
     sections.append('')
 
     # Connection Summary
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append('CONNECTION SUMMARY')
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append(_format_connection_table(parsed))
     sections.append('')
 
     # Attack Pattern Detection
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append('ATTACK PATTERN DETECTION')
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     if detections:
         for severity, name, desc, conn, principal in detections:
             if severity == 'HIGH':
@@ -2474,9 +2474,9 @@ def generate_summary_report(all_xml, pcap_path):
     sections.append('')
 
     # Query Details
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append('QUERY DETAILS')
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     qd = _format_query_details(parsed)
     if qd.strip():
         sections.append(qd)
@@ -2485,15 +2485,15 @@ def generate_summary_report(all_xml, pcap_path):
     sections.append('')
 
     # Extracted Objects
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append('EXTRACTED AD OBJECTS')
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append(_format_object_tables(parsed))
 
     # Statistics
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append('STATISTICS')
-    sections.append('─' * 78)
+    sections.append('-' * 78)
     sections.append(_format_statistics(parsed))
     sections.append('')
     sections.append('=' * 78)
@@ -2501,7 +2501,7 @@ def generate_summary_report(all_xml, pcap_path):
     return '\n'.join(sections)
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
+# --- Main --------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2619,7 +2619,7 @@ def main():
         print(f"  C2S: {len(c2s)} bytes ({c2s_gaps} gaps)")
         print(f"  S2C: {len(s2c)} bytes ({s2c_gaps} gaps)")
         if c2s_gaps or s2c_gaps:
-            print(f"  WARNING: TCP gaps detected — decryption may fail")
+            print(f"  WARNING: TCP gaps detected - decryption may fail")
 
         auth_method = None
         principal = None
